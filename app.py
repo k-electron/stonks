@@ -2,10 +2,9 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime
 
-# --- PAGE CONFIG ---
+# --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Market Regime Control Center", layout="wide", page_icon="🎛️")
 
 # --- 1. SIDEBAR: USER PREFERENCES ---
@@ -36,7 +35,6 @@ with st.sidebar.expander("3. Lookback Windows"):
                               help="Number of days to compare relative performance (e.g. Gold vs Stocks).")
 
 # --- 2. DATA ENGINE (Cached) ---
-# We cache this function so changing sliders doesn't re-download data every time
 @st.cache_data(ttl=900) 
 def get_data():
     tickers = {
@@ -45,19 +43,30 @@ def get_data():
         'Indicators': ['^VIX', '^VIX3M', 'HYG', 'IEF']
     }
     all_symbols = [item for sublist in tickers.values() for item in sublist]
+    
     # Fetch ample history to calculate max SMA (365) + buffers
     data = yf.download(all_symbols, period="2y", progress=False)
     return data, tickers
 
 # --- 3. LOGIC ENGINE (Dynamic) ---
 def process_signals(data, tickers):
-    # Handle yfinance MultiIndex
+    # Handle yfinance MultiIndex structure
     try:
         closes = data['Close']
         highs = data['High']
         lows = data['Low']
     except KeyError:
         closes = data
+        highs = data
+        lows = data
+
+    # --- THE FIX: WEEKEND DATA HANDLING ---
+    # Crypto trades on Sunday, creating new rows where SPY is NaN.
+    # We forward fill (ffill) to carry Friday's SPY price into Sunday.
+    closes = closes.ffill()
+    highs = highs.ffill()
+    lows = lows.ffill()
+    # --------------------------------------
 
     latest = closes.iloc[-1]
     
@@ -65,25 +74,31 @@ def process_signals(data, tickers):
     spy_price = latest['SPY']
     spy_sma = closes['SPY'].rolling(window=sma_window).mean().iloc[-1]
     
-    # ADX Calculation
+    # ADX Calculation (Trend Strength)
     def calc_adx(high, low, close, lookback=14):
         plus_dm = high.diff()
         minus_dm = low.diff()
         plus_dm[plus_dm < 0] = 0
         minus_dm[minus_dm > 0] = 0
+        
         tr1 = pd.DataFrame(high - low)
         tr2 = pd.DataFrame(abs(high - close.shift(1)))
         tr3 = pd.DataFrame(abs(low - close.shift(1)))
+        
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         atr = tr.rolling(lookback).mean()
+        
         plus_di = 100 * (plus_dm.ewm(alpha=1/lookback).mean() / atr)
         minus_di = 100 * (abs(minus_dm).ewm(alpha=1/lookback).mean() / atr)
-        dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di)) * 100
+        
+        # Handle division by zero
+        sum_di = plus_di + minus_di
+        dx = 100 * (abs(plus_di - minus_di) / sum_di)
         return dx.rolling(lookback).mean().iloc[-1]
 
     adx_val = calc_adx(highs['SPY'], lows['SPY'], closes['SPY'])
     
-    # RSI Calculation
+    # RSI Calculation (Momentum)
     delta = closes['SPY'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -91,7 +106,11 @@ def process_signals(data, tickers):
     rsi_val = 100 - (100 / (1 + rs)).iloc[-1]
     
     # B. DETERMINING REGIME STRING
-    if spy_price > spy_sma:
+    if pd.isna(spy_sma): 
+        # Safety check if not enough data for SMA window
+        trend = "Loading..."
+        sub_trend = "Insufficient Data"
+    elif spy_price > spy_sma:
         trend = "BULL"
         if rsi_val > rsi_overbought: sub_trend = "OVERHEATED"
         elif adx_val > adx_threshold: sub_trend = "STRONG/SUSTAINED"
@@ -150,10 +169,14 @@ try:
     c3.metric("Momentum (RSI)", f"{sig['rsi']:.1f}", rsi_state)
 
     # 4. Term Structure
-    contango = sig['vix'] < sig['vix3m']
-    c4.metric("VIX Term Structure", f"{sig['vix']/sig['vix3m']:.2f}", 
-              "Healthy (Contango)" if contango else "DANGER (Backwardation)",
-              delta_color="normal" if contango else "inverse")
+    # Check for NaN in VIX3M (sometimes Yahoo data is spotty)
+    if pd.isna(sig['vix3m']) or sig['vix3m'] == 0:
+        c4.metric("VIX Term Structure", "N/A", "Data Unavailable", delta_color="off")
+    else:
+        contango = sig['vix'] < sig['vix3m']
+        c4.metric("VIX Term Structure", f"{sig['vix']/sig['vix3m']:.2f}", 
+                  "Healthy (Contango)" if contango else "DANGER (Backwardation)",
+                  delta_color="normal" if contango else "inverse")
 
     st.markdown("---")
 
@@ -188,7 +211,8 @@ try:
     # RAW DATA CHECK
     with st.expander("Show Raw Signal Data"):
         st.write("Current calculated metrics based on your settings:")
-        st.json(sig)
+        # Convert numpy types to native types for cleaner JSON display if needed
+        st.write(sig)
 
 except Exception as e:
     st.error(f"System Error: {e}")
