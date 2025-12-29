@@ -7,234 +7,237 @@ import plotly.express as px
 from datetime import datetime
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Market Regime Compass", layout="wide", page_icon="🧭")
+st.set_page_config(page_title="Market Command Center", layout="wide", page_icon="📡")
 
-# --- 1. SIDEBAR: THRESHOLDS ---
-st.sidebar.header("🎛️ Calibration")
+# --- 1. SIDEBAR: CONTROLS ---
+st.sidebar.header("🎛️ Control Panel")
 
-with st.sidebar.expander("1. Trend Boundaries (Y-Axis)", expanded=True):
-    sma_slow = st.number_input("Bull/Bear Line (SMA)", 50, 365, 200, help="The boundary between Bull and Bear.")
-    sma_fast = st.number_input("Conflict Zone (SMA)", 20, 100, 50, help="Used to define the 'Conflict/Chop' middle zone.")
+with st.sidebar.expander("1. Trend Thresholds", expanded=True):
+    sma_slow = st.number_input("Bull/Bear Line (SMA)", 50, 365, 200)
+    sma_fast = st.number_input("Conflict Zone (SMA)", 20, 100, 50)
 
-with st.sidebar.expander("2. Value Boundaries (X-Axis)", expanded=True):
+with st.sidebar.expander("2. Valuation Thresholds", expanded=True):
     pe_cheap = st.slider("Undervalued P/E", 10, 20, 15)
     pe_expensive = st.slider("Overvalued P/E", 20, 40, 25)
 
-# --- 2. DATA ENGINE ---
+with st.sidebar.expander("3. Sector Rotation", expanded=True):
+    cycle_window = st.slider("Trend Lookback (Days)", 10, 100, 20)
+    momentum_window = st.slider("Momentum Lookback (Days)", 3, 30, 10)
+
+# --- 2. DATA ENGINE (ROBUST) ---
 @st.cache_data(ttl=3600)
-def get_data_and_fundamentals():
-    tickers = ['SPY', '^VIX']
-    # Fetch History
-    data = yf.download(tickers, period="2y", progress=False)
+def get_market_data():
+    # Define Universe
+    tickers = {
+        'Index': ['SPY', '^VIX'],
+        'Sectors': ['XLK', 'XLE', 'XLF', 'XLV', 'XLP', 'XLY', 'XLI', 'XLB', 'XLRE', 'XLC', 'XLU']
+    }
+    all_syms = tickers['Index'] + tickers['Sectors']
     
-    # Fetch SPY Fundamentals (Earnings)
-    # We derive Earnings from Price / PE to reverse engineer the "E"
+    # 1. Download Data
+    # Group_by='ticker' ensures we get a clean MultiIndex
+    data = yf.download(all_syms, period="2y", group_by='ticker', progress=False)
+    
+    # 2. FLATTEN & CLEAN (The NaN Fix)
+    # We want a DataFrame where columns are (Ticker, Metric)
+    # But yfinance might return (Metric, Ticker) or vice versa depending on version.
+    # We will normalize by extracting just 'Close'.
+    
+    df_close = pd.DataFrame()
+    for sym in all_syms:
+        try:
+            # Handle different yfinance return shapes
+            if isinstance(data.columns, pd.MultiIndex):
+                # Try accessing via top level key
+                series = data[sym]['Close']
+            else:
+                # Flat format
+                series = data['Close'] # If single ticker
+            
+            df_close[sym] = series
+        except KeyError:
+            continue
+            
+    # CRITICAL FIX: Forward Fill to handle weekends (Crypto) or Holidays
+    df_close = df_close.ffill()
+    # Drop any remaining NaNs at the start (before data existed)
+    df_close = df_close.dropna()
+    
+    # 3. Fetch Fundamentals (P/E)
+    # We prioritize SPY for the matrix. Sectors are "nice to have".
+    fundamentals = {}
     spy_ticker = yf.Ticker("SPY")
     try:
-        current_pe = spy_ticker.info.get('trailingPE', 24.5) # Default fallback if API fails
-        price = data['Close']['SPY'].iloc[-1]
-        earnings = price / current_pe
+        # P/E is often hidden in 'trailingPE' or computed via 'forwardPE'
+        fundamentals['SPY'] = spy_ticker.info.get('trailingPE', 25.0) # Default fallback
     except:
-        current_pe = 25.0
-        earnings = 10.0 # Fallback
+        fundamentals['SPY'] = 25.0
         
-    return data, current_pe, earnings
+    return df_close, fundamentals, tickers
 
-# --- 3. LOGIC & SCENARIO ENGINE ---
-def calculate_regime_state(price, sma200, sma50, pe, pe_cheap, pe_exp):
-    # 1. Determine Trend Coordinate (Y)
-    # 0 = Bear, 1 = Conflict, 2 = Bull
-    if price < sma200 and price < sma50:
-        trend_score = 0 # Bear
-        trend_name = "BEAR"
-    elif price > sma200 and price > sma50:
-        trend_score = 2 # Bull
-        trend_name = "BULL"
-    else:
-        trend_score = 1 # Conflict
-        trend_name = "CONFLICT"
+# --- 3. LOGIC ENGINES ---
 
-    # 2. Determine Value Coordinate (X)
-    # 0 = Undervalued, 1 = Fair, 2 = Overvalued
-    if pe < pe_cheap:
-        value_score = 0
-        value_name = "UNDERVALUED"
-    elif pe > pe_exp:
-        value_score = 2
-        value_name = "OVERVALUED"
-    else:
-        value_score = 1
-        value_name = "FAIR VALUE"
-
-    # 3. Define the 9 Narratives
-    matrix_names = [
-        ["Value Trap (Catching Knives)", "Standard Correction", "Bubble Pop (Crash)"],  # Bear Row
-        ["Accumulation Zone", "Rotation / Chop", "Distribution Top"],                   # Conflict Row
-        ["Generational Buy", "Goldilocks Growth", "Melt-Up (FOMO)"]                     # Bull Row
+def get_regime_narrative(price, sma200, sma50, pe, pe_cheap, pe_exp):
+    # Trend Coordinate (Y): 0=Bear, 1=Conflict, 2=Bull
+    if price < sma200 and price < sma50: t_score = 0
+    elif price > sma200 and price > sma50: t_score = 2
+    else: t_score = 1
+    
+    # Value Coordinate (X): 0=Cheap, 1=Fair, 2=Expensive
+    if pe < pe_cheap: v_score = 0
+    elif pe > pe_exp: v_score = 2
+    else: v_score = 1
+    
+    matrix = [
+        ["Value Trap", "Correction", "Bubble Pop"],    # Bear
+        ["Accumulation", "Rotation", "Distribution"],  # Conflict
+        ["Gen. Buy", "Goldilocks", "Melt-Up"]          # Bull
     ]
-    
-    current_narrative = matrix_names[trend_score][value_score]
-    
-    return trend_score, value_score, trend_name, value_name, current_narrative
+    return t_score, v_score, matrix[t_score][v_score]
 
-def calculate_scenarios(price, earnings, sma200, sma50, pe_cheap, pe_exp):
-    """
-    Calculates distance to nearest boundaries
-    """
-    scenarios = []
+def calculate_rrg(df_close, sectors, benchmark='SPY'):
+    results = []
+    bench = df_close[benchmark]
     
-    # A. Price Moves (Vertical Shift)
-    dist_to_bear = ((sma200 - price) / price) * 100
-    if price > sma200:
-        scenarios.append(f"📉 **- {abs(dist_to_bear):.1f}% drop** leads to **BEAR** Trend.")
-    else:
-        scenarios.append(f"📈 **+ {abs(dist_to_bear):.1f}% rally** leads to **BULL** Trend.")
-
-    # B. Valuation Moves (Horizontal Shift)
-    # Target Price = Target_PE * Earnings
-    target_price_fair = pe_cheap * earnings
-    target_price_exp = pe_exp * earnings
-    
-    dist_to_fair = ((target_price_fair - price) / price) * 100
-    dist_to_exp = ((target_price_exp - price) / price) * 100
-    
-    current_pe = price / earnings
-    
-    if current_pe > pe_exp:
-        scenarios.append(f"📉 **- {abs(dist_to_exp):.1f}% drop** (or earnings growth) needed to reach **FAIR VALUE**.")
-    elif current_pe < pe_cheap:
-        scenarios.append(f"📈 **+ {abs(dist_to_fair):.1f}% rally** needed to become **FAIR VALUE**.")
+    for sec in sectors:
+        # Relative Strength
+        rs = df_close[sec] / bench
         
-    return scenarios
-
-# --- 4. VISUALIZATION ENGINE ---
-def plot_regime_compass(trend_score, value_score):
-    # The Grid Labels
-    z = [[0, 1, 2], [3, 4, 5], [6, 7, 8]] # Color mapping
+        # RS-Ratio (Trend) - Normalize around 100
+        rs_mean = rs.rolling(window=cycle_window).mean()
+        rs_ratio = 100 + ((rs - rs_mean) / rs_mean) * 100
+        
+        # RS-Momentum (Rate of Change of Trend)
+        rs_mom = 100 + rs_ratio.diff(momentum_window)
+        
+        # Current State
+        curr_r = rs_ratio.iloc[-1]
+        curr_m = rs_mom.iloc[-1]
+        
+        if curr_r > 100 and curr_m > 100: status = "LEADING"
+        elif curr_r > 100 and curr_m < 100: status = "WEAKENING"
+        elif curr_r < 100 and curr_m < 100: status = "LAGGING"
+        else: status = "IMPROVING"
+            
+        results.append({
+            'Sector': sec,
+            'RS_Ratio': curr_r,
+            'RS_Momentum': curr_m,
+            'Status': status
+        })
     
-    # Custom Colors for the heatmap (Red -> Yellow -> Green logic mixed with Risk)
-    # Row 0 (Bear): Blue (Cheap Trap), Red (Correction), Dark Red (Crash)
-    # Row 1 (Chop): Cyan (Accum), Gray (Chop), Orange (Dist)
-    # Row 2 (Bull): Bright Green (Gen Buy), Green (Goldilocks), Magenta (Melt Up)
+    return pd.DataFrame(results)
+
+def plot_compass(t_score, v_score):
+    # Heatmap Colors
     colors = [
-        [0.0, "blue"], [0.1, "red"], [0.3, "darkred"],      # Bear Row
-        [0.4, "cyan"], [0.5, "gray"], [0.6, "orange"],      # Conflict Row
-        [0.7, "lime"], [0.8, "green"], [1.0, "magenta"]     # Bull Row
+        [0.0, "blue"], [0.5, "gray"], [1.0, "magenta"] 
     ]
-    
     labels = [
         ["Value Trap", "Correction", "Bubble Pop"],
         ["Accumulation", "Rotation", "Distribution"],
         ["Gen. Buy", "Goldilocks", "Melt-Up"]
     ]
-
+    
     fig = go.Figure()
-
-    # 1. The Heatmap Background
     fig.add_trace(go.Heatmap(
-        z=[[0.2, 0.1, 0.05], [0.5, 0.4, 0.3], [0.9, 0.8, 0.6]], # Dummy Z for coloring
-        x=['Undervalued', 'Fair', 'Overvalued'],
+        z=[[0, 1, 2], [3, 4, 5], [6, 7, 8]],
+        x=['Cheap', 'Fair', 'Expensive'],
         y=['Bear', 'Conflict', 'Bull'],
-        colorscale='RdYlGn', 
-        showscale=False,
-        opacity=0.6
+        colorscale='RdYlGn', opacity=0.6, showscale=False
     ))
-
-    # 2. The Text Labels
-    annotations = []
+    
+    # Add Text Labels
     for y in range(3):
         for x in range(3):
-            fig.add_annotation(
-                x=x, y=y,
-                text=f"<b>{labels[y][x]}</b>",
-                showarrow=False,
-                font=dict(color="black", size=14)
-            )
-
-    # 3. The "You Are Here" Marker
-    # We add random jitter to the score so the dot isn't always perfectly centered, 
-    # making it look more analog if we had granular data (simulated here for UI)
+            fig.add_annotation(x=x, y=y, text=f"<b>{labels[y][x]}</b>", showarrow=False)
+            
+    # Add "YOU" Marker
     fig.add_trace(go.Scatter(
-        x=[value_score], y=[trend_score],
-        mode='markers+text',
-        marker=dict(size=25, color='white', line=dict(width=3, color='black')),
-        text=["📍 YOU"], textposition="top center",
-        name="Current State"
+        x=[v_score], y=[t_score], mode='markers+text',
+        marker=dict(size=30, color='white', line=dict(width=3, color='black')),
+        text=["📍 YOU"], textposition="top center"
     ))
-
-    fig.update_layout(
-        title="The 9 Narratives Matrix",
-        xaxis=dict(title="Valuation", side="bottom"),
-        yaxis=dict(title="Trend Strength"),
-        height=500,
-        margin=dict(l=20, r=20, t=40, b=20)
-    )
+    
+    fig.update_layout(height=400, margin=dict(l=20, r=20, t=20, b=20))
     return fig
 
-# --- 5. MAIN EXECUTION ---
+# --- 4. EXECUTION ---
 try:
-    with st.spinner("Calibrating Compass..."):
-        data, current_pe, earnings = get_data_and_fundamentals()
+    with st.spinner("Analyzing Market Structure..."):
+        df, funds, tickers = get_market_data()
         
-        # Process Data
-        try:
-            closes = data['Close'].ffill()
-        except KeyError:
-            closes = data.ffill()
-
-        price = closes['SPY'].iloc[-1]
-        sma200 = closes['SPY'].rolling(sma_slow).mean().iloc[-1]
-        sma50 = closes['SPY'].rolling(sma_fast).mean().iloc[-1]
-        
-        # Calculate State
-        t_score, v_score, t_name, v_name, narrative = calculate_regime_state(
-            price, sma200, sma50, current_pe, pe_cheap, pe_expensive
-        )
-        
-        # Calculate Scenarios
-        next_moves = calculate_scenarios(price, earnings, sma200, sma50, pe_cheap, pe_expensive)
-
-    # --- UI LAYOUT ---
-    st.title(f"📍 Market Status: {narrative}")
+    # --- MACRO ANALYSIS (SPY) ---
+    spy = df['SPY']
+    current_price = spy.iloc[-1]
+    sma200 = spy.rolling(sma_slow).mean().iloc[-1]
+    sma50 = spy.rolling(sma_fast).mean().iloc[-1]
+    current_pe = funds['SPY']
     
-    # Top Metrics
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Current Regime", f"{t_name} + {v_name}", narrative)
-    c2.metric("S&P 500 Price", f"${price:.2f}", f"{(price/sma200 - 1)*100:.1f}% vs SMA{sma_slow}")
-    c3.metric("Valuation (P/E)", f"{current_pe:.1f}x", f"Earnings Est: ${earnings:.2f}")
-    c4.metric("Risk Level", "HIGH" if v_score==2 or t_score==0 else "MODERATE")
+    t_score, v_score, narrative = get_regime_narrative(
+        current_price, sma200, sma50, current_pe, pe_cheap, pe_expensive
+    )
+    
+    # --- SECTOR ANALYSIS (RRG) ---
+    rrg_df = calculate_rrg(df, tickers['Sectors'])
+
+    # --- DASHBOARD RENDER ---
+    st.title(f"📡 Market Status: {narrative}")
+    
+    # TOP ROW: METRICS
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Market Trend", "BULL" if t_score==2 else "BEAR" if t_score==0 else "CONFLICT", 
+              f"Price ${current_price:.0f}")
+    m2.metric("Valuation (P/E)", f"{current_pe:.1f}x", 
+              "Expensive" if v_score==2 else "Cheap" if v_score==0 else "Fair",
+              delta_color="inverse")
+    
+    # VIX Handling
+    if '^VIX' in df.columns:
+        vix = df['^VIX'].iloc[-1]
+        m3.metric("Volatility (VIX)", f"{vix:.2f}", "High Risk" if vix > 20 else "Stable", delta_color="inverse")
+    
+    # Forecast / Distance
+    dist_bear = (current_price - sma200) / current_price
+    m4.metric("Safety Cushion", f"{dist_bear:.1%}", "Distance to Bear Market")
 
     st.markdown("---")
 
-    # The Core Matrix & Forecast
-    col_map, col_logic = st.columns([2, 1])
-
-    with col_map:
-        st.subheader("🗺️ The Strategic Map")
-        fig = plot_regime_compass(t_score, v_score)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_logic:
-        st.subheader("🔮 Forecast & Next Moves")
-        st.info(f"We are currently in the **{narrative}** zone.")
+    # MIDDLE ROW: COMPASS & SECTORS
+    c_left, c_right = st.columns([1, 2])
+    
+    with c_left:
+        st.subheader("🗺️ Regime Compass")
+        st.caption("Where are we in the Big Cycle?")
+        fig_compass = plot_compass(t_score, v_score)
+        st.plotly_chart(fig_compass, use_container_width=True)
         
-        st.markdown("### How we leave this zone:")
-        for move in next_moves:
-            st.markdown(move)
-            
-        st.markdown("---")
-        st.markdown("### Strategic Directive:")
-        if narrative == "Melt-Up (FOMO)":
-            st.warning("⚠️ **Strategy:** Participate, but tighten stops. Do not add new leverage. Look for exit liquidity.")
-        elif narrative == "Goldilocks Growth":
-            st.success("✅ **Strategy:** Buy Aggressively. Fundamentals and Technicals agree.")
-        elif narrative == "Value Trap (Catching Knives)":
-            st.error("🛑 **Strategy:** Do NOT Buy. Wait for Trend to turn Positive (Price > SMA).")
-        elif narrative == "Distribution Top":
-            st.warning("⚠️ **Strategy:** Reduce Position Size. Smart money is selling.")
-        else:
-            st.info("ℹ️ **Strategy:** Stick to your system. No extreme signals present.")
+        st.info(f"**Insight:** The market is currently **{narrative}**. Ensure your position sizing matches this environment.")
+
+    with c_right:
+        st.subheader("🔄 Sector Rotation (RRG)")
+        st.caption("Which engines are firing? (Top Right = Leaders)")
+        
+        # Static Quadrant Background
+        fig_rrg = px.scatter(rrg_df, x="RS_Ratio", y="RS_Momentum", 
+                             color="Status", text="Sector",
+                             color_discrete_map={
+                                 "LEADING": "green", "WEAKENING": "orange",
+                                 "LAGGING": "red", "IMPROVING": "blue"
+                             },
+                             hover_data=["RS_Ratio", "RS_Momentum"])
+        
+        fig_rrg.add_hline(y=100, line_color="gray", line_dash="dash")
+        fig_rrg.add_vline(x=100, line_color="gray", line_dash="dash")
+        fig_rrg.update_traces(textposition='top center', marker_size=12)
+        fig_rrg.update_layout(height=450, xaxis_title="Relative Trend", yaxis_title="Relative Momentum")
+        
+        st.plotly_chart(fig_rrg, use_container_width=True)
+
+    # BOTTOM ROW: DETAILS
+    with st.expander("📊 View Raw Sector Data"):
+        st.dataframe(rrg_df.sort_values("RS_Ratio", ascending=False).style.background_gradient(cmap="Greens", subset=["RS_Ratio"]), use_container_width=True)
 
 except Exception as e:
-    st.error(f"System Error: {e}")
-    st.write("Debug Info:", e)
+    st.error(f"Critical Error: {e}")
+    st.write("Debug Trace:", e)
