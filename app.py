@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime
+import traceback
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="Market Command Center", layout="wide", page_icon="📡")
@@ -146,6 +146,10 @@ def calculate_rrg(df_close, sectors, benchmark='SPY'):
     return pd.DataFrame(results)
 
 def plot_compass(t_score, v_score):
+    # Define Categories exactly as they appear on axis
+    x_cats = ['Cheap', 'Fair', 'Expensive']
+    y_cats = ['Bear', 'Conflict', 'Bull']
+    
     labels = [
         ["Value Trap", "Correction", "Bubble Pop"],
         ["Accumulation", "Rotation", "Distribution"],
@@ -153,26 +157,46 @@ def plot_compass(t_score, v_score):
     ]
     
     fig = go.Figure()
+    
+    # 1. HEATMAP (Background)
     fig.add_trace(go.Heatmap(
         z=[[0, 1, 2], [3, 4, 5], [6, 7, 8]],
-        x=['Cheap', 'Fair', 'Expensive'],
-        y=['Bear', 'Conflict', 'Bull'],
-        colorscale='RdYlGn', opacity=0.6, showscale=False
+        x=x_cats, 
+        y=y_cats,
+        colorscale='RdYlGn', 
+        opacity=0.6, 
+        showscale=False,
+        hoverinfo='skip'
     ))
     
-    # Add Text Labels
+    # 2. LABELS
     for y in range(3):
         for x in range(3):
-            fig.add_annotation(x=x, y=y, text=f"<b>{labels[y][x]}</b>", showarrow=False)
+            fig.add_annotation(
+                x=x_cats[x], y=y_cats[y], 
+                text=f"<b>{labels[y][x]}</b>", 
+                showarrow=False,
+                font=dict(color="black")
+            )
             
-    # Add "YOU" Marker
+    # 3. MARKER (FIXED)
+    # We map the integer score back to the Category String
+    # This ensures the dot lands on the square, not the numeric axis
     fig.add_trace(go.Scatter(
-        x=[v_score], y=[t_score], mode='markers+text',
-        marker=dict(size=30, color='white', line=dict(width=3, color='black')),
-        text=["📍 YOU"], textposition="top center"
+        x=[x_cats[v_score]], 
+        y=[y_cats[t_score]], 
+        mode='markers+text',
+        marker=dict(size=35, color='white', line=dict(width=4, color='black')),
+        text=["📍 YOU"], textposition="top center",
+        hoverinfo='skip'
     ))
     
-    fig.update_layout(height=400, margin=dict(l=20, r=20, t=20, b=20))
+    fig.update_layout(
+        height=400, 
+        margin=dict(l=20, r=20, t=20, b=20),
+        xaxis=dict(type='category', fixedrange=True), # Force categorical
+        yaxis=dict(type='category', fixedrange=True)
+    )
     return fig
 
 # --- 4. EXECUTION ---
@@ -279,5 +303,4 @@ try:
 except Exception as e:
     st.error(f"Critical System Error: {e}")
     # Print simple trace for debugging
-    import traceback
     st.text(traceback.format_exc())
