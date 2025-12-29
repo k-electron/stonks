@@ -40,7 +40,6 @@ def get_market_data():
     
     # 2. FLATTEN & CLEAN (The NaN Fix)
     # We want a DataFrame where columns are (Ticker, Metric)
-    # But yfinance might return (Metric, Ticker) or vice versa depending on version.
     # We will normalize by extracting just 'Close'.
     
     df_close = pd.DataFrame()
@@ -130,9 +129,6 @@ def calculate_rrg(df_close, sectors, benchmark='SPY'):
 
 def plot_compass(t_score, v_score):
     # Heatmap Colors
-    colors = [
-        [0.0, "blue"], [0.5, "gray"], [1.0, "magenta"] 
-    ]
     labels = [
         ["Value Trap", "Correction", "Bubble Pop"],
         ["Accumulation", "Rotation", "Distribution"],
@@ -236,7 +232,11 @@ try:
 
     # BOTTOM ROW: DETAILS
     with st.expander("📊 View Raw Sector Data"):
-        st.dataframe(rrg_df.sort_values("RS_Ratio", ascending=False).style.background_gradient(cmap="Greens", subset=["RS_Ratio"]), use_container_width=True)
+        # We try to apply styling, but if matplotlib is missing or fails, we fall back to raw dataframe
+        try:
+            st.dataframe(rrg_df.sort_values("RS_Ratio", ascending=False).style.background_gradient(cmap="Greens", subset=["RS_Ratio"]), use_container_width=True)
+        except Exception:
+            st.dataframe(rrg_df.sort_values("RS_Ratio", ascending=False), use_container_width=True)
 
 except Exception as e:
     st.error(f"Critical Error: {e}")
