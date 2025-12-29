@@ -35,40 +35,44 @@ def get_market_data():
     all_syms = tickers['Index'] + tickers['Sectors']
     
     # 1. Download Data
-    # Group_by='ticker' ensures we get a clean MultiIndex
-    data = yf.download(all_syms, period="2y", group_by='ticker', progress=False)
+    # auto_adjust=True helps with splits/dividends
+    data = yf.download(all_syms, period="2y", group_by='ticker', auto_adjust=True, progress=False)
     
-    # 2. FLATTEN & CLEAN (The NaN Fix)
-    # We want a DataFrame where columns are (Ticker, Metric)
-    # We will normalize by extracting just 'Close'.
-    
+    if data.empty:
+        return pd.DataFrame(), {}, tickers
+
+    # 2. FLATTEN & CLEAN
     df_close = pd.DataFrame()
+    
+    # Iterate through symbols and safely extract 'Close'
     for sym in all_syms:
         try:
-            # Handle different yfinance return shapes
+            # Handle MultiIndex (Ticker -> Close) vs Single Index
             if isinstance(data.columns, pd.MultiIndex):
-                # Try accessing via top level key
-                series = data[sym]['Close']
+                if sym in data.columns.levels[0]:
+                    df_close[sym] = data[sym]['Close']
             else:
-                # Flat format
-                series = data['Close'] # If single ticker
+                # Fallback for single ticker download scenarios
+                if 'Close' in data.columns:
+                    df_close[sym] = data['Close']
+        except Exception:
+            continue # Skip bad tickers, don't crash
             
-            df_close[sym] = series
-        except KeyError:
-            continue
-            
-    # CRITICAL FIX: Forward Fill to handle weekends (Crypto) or Holidays
+    # CRITICAL FIX 1: Forward Fill (Fixes Weekends/Holidays)
     df_close = df_close.ffill()
-    # Drop any remaining NaNs at the start (before data existed)
-    df_close = df_close.dropna()
+    
+    # CRITICAL FIX 2: Do NOT dropna(). 
+    # Just drop rows where SPY specifically is missing, as SPY is the engine.
+    if 'SPY' in df_close.columns:
+        df_close = df_close.dropna(subset=['SPY'])
     
     # 3. Fetch Fundamentals (P/E)
-    # We prioritize SPY for the matrix. Sectors are "nice to have".
     fundamentals = {}
-    spy_ticker = yf.Ticker("SPY")
     try:
-        # P/E is often hidden in 'trailingPE' or computed via 'forwardPE'
-        fundamentals['SPY'] = spy_ticker.info.get('trailingPE', 25.0) # Default fallback
+        spy_ticker = yf.Ticker("SPY")
+        # specific check to avoid yfinance errors
+        funds = spy_ticker.info
+        fundamentals['SPY'] = funds.get('trailingPE', 25.0)
     except:
         fundamentals['SPY'] = 25.0
         
@@ -96,9 +100,16 @@ def get_regime_narrative(price, sma200, sma50, pe, pe_cheap, pe_exp):
 
 def calculate_rrg(df_close, sectors, benchmark='SPY'):
     results = []
+    
+    if benchmark not in df_close.columns:
+        return pd.DataFrame() # Fail gracefully if SPY missing
+
     bench = df_close[benchmark]
     
     for sec in sectors:
+        if sec not in df_close.columns:
+            continue
+            
         # Relative Strength
         rs = df_close[sec] / bench
         
@@ -110,25 +121,31 @@ def calculate_rrg(df_close, sectors, benchmark='SPY'):
         rs_mom = 100 + rs_ratio.diff(momentum_window)
         
         # Current State
-        curr_r = rs_ratio.iloc[-1]
-        curr_m = rs_mom.iloc[-1]
-        
-        if curr_r > 100 and curr_m > 100: status = "LEADING"
-        elif curr_r > 100 and curr_m < 100: status = "WEAKENING"
-        elif curr_r < 100 and curr_m < 100: status = "LAGGING"
-        else: status = "IMPROVING"
+        try:
+            curr_r = rs_ratio.iloc[-1]
+            curr_m = rs_mom.iloc[-1]
             
-        results.append({
-            'Sector': sec,
-            'RS_Ratio': curr_r,
-            'RS_Momentum': curr_m,
-            'Status': status
-        })
+            # Handle NaNs in calculation (e.g. recent IPOs)
+            if pd.isna(curr_r) or pd.isna(curr_m):
+                continue
+                
+            if curr_r > 100 and curr_m > 100: status = "LEADING"
+            elif curr_r > 100 and curr_m < 100: status = "WEAKENING"
+            elif curr_r < 100 and curr_m < 100: status = "LAGGING"
+            else: status = "IMPROVING"
+                
+            results.append({
+                'Sector': sec,
+                'RS_Ratio': curr_r,
+                'RS_Momentum': curr_m,
+                'Status': status
+            })
+        except:
+            continue
     
     return pd.DataFrame(results)
 
 def plot_compass(t_score, v_score):
-    # Heatmap Colors
     labels = [
         ["Value Trap", "Correction", "Bubble Pop"],
         ["Accumulation", "Rotation", "Distribution"],
@@ -163,12 +180,26 @@ try:
     with st.spinner("Analyzing Market Structure..."):
         df, funds, tickers = get_market_data()
         
+    # --- SAFETY CHECK ---
+    if df.empty or 'SPY' not in df.columns:
+        st.error("⚠️ Data Download Failed. Unable to retrieve SPY data from Yahoo Finance.")
+        st.info("Check your internet connection or try again in 5 minutes (API Rate Limit).")
+        st.stop()
+
     # --- MACRO ANALYSIS (SPY) ---
     spy = df['SPY']
     current_price = spy.iloc[-1]
-    sma200 = spy.rolling(sma_slow).mean().iloc[-1]
-    sma50 = spy.rolling(sma_fast).mean().iloc[-1]
-    current_pe = funds['SPY']
+    
+    # Calculate SMAs (Check for sufficiency data)
+    if len(spy) < sma_slow:
+        st.warning(f"Not enough data history to calculate {sma_slow}-day SMA. Showing available data.")
+        sma200 = spy.mean() # Fallback
+        sma50 = spy.mean()
+    else:
+        sma200 = spy.rolling(sma_slow).mean().iloc[-1]
+        sma50 = spy.rolling(sma_fast).mean().iloc[-1]
+        
+    current_pe = funds.get('SPY', 25.0)
     
     t_score, v_score, narrative = get_regime_narrative(
         current_price, sma200, sma50, current_pe, pe_cheap, pe_expensive
@@ -192,6 +223,8 @@ try:
     if '^VIX' in df.columns:
         vix = df['^VIX'].iloc[-1]
         m3.metric("Volatility (VIX)", f"{vix:.2f}", "High Risk" if vix > 20 else "Stable", delta_color="inverse")
+    else:
+        m3.metric("Volatility (VIX)", "N/A", "Data Missing", delta_color="off")
     
     # Forecast / Distance
     dist_bear = (current_price - sma200) / current_price
@@ -214,30 +247,37 @@ try:
         st.subheader("🔄 Sector Rotation (RRG)")
         st.caption("Which engines are firing? (Top Right = Leaders)")
         
-        # Static Quadrant Background
-        fig_rrg = px.scatter(rrg_df, x="RS_Ratio", y="RS_Momentum", 
-                             color="Status", text="Sector",
-                             color_discrete_map={
-                                 "LEADING": "green", "WEAKENING": "orange",
-                                 "LAGGING": "red", "IMPROVING": "blue"
-                             },
-                             hover_data=["RS_Ratio", "RS_Momentum"])
-        
-        fig_rrg.add_hline(y=100, line_color="gray", line_dash="dash")
-        fig_rrg.add_vline(x=100, line_color="gray", line_dash="dash")
-        fig_rrg.update_traces(textposition='top center', marker_size=12)
-        fig_rrg.update_layout(height=450, xaxis_title="Relative Trend", yaxis_title="Relative Momentum")
-        
-        st.plotly_chart(fig_rrg, use_container_width=True)
+        if not rrg_df.empty:
+            # Static Quadrant Background
+            fig_rrg = px.scatter(rrg_df, x="RS_Ratio", y="RS_Momentum", 
+                                 color="Status", text="Sector",
+                                 color_discrete_map={
+                                     "LEADING": "green", "WEAKENING": "orange",
+                                     "LAGGING": "red", "IMPROVING": "blue"
+                                 },
+                                 hover_data=["RS_Ratio", "RS_Momentum"])
+            
+            fig_rrg.add_hline(y=100, line_color="gray", line_dash="dash")
+            fig_rrg.add_vline(x=100, line_color="gray", line_dash="dash")
+            fig_rrg.update_traces(textposition='top center', marker_size=12)
+            fig_rrg.update_layout(height=450, xaxis_title="Relative Trend", yaxis_title="Relative Momentum")
+            st.plotly_chart(fig_rrg, use_container_width=True)
+        else:
+            st.warning("Not enough sector data to generate RRG.")
 
     # BOTTOM ROW: DETAILS
     with st.expander("📊 View Raw Sector Data"):
-        # We try to apply styling, but if matplotlib is missing or fails, we fall back to raw dataframe
-        try:
-            st.dataframe(rrg_df.sort_values("RS_Ratio", ascending=False).style.background_gradient(cmap="Greens", subset=["RS_Ratio"]), use_container_width=True)
-        except Exception:
-            st.dataframe(rrg_df.sort_values("RS_Ratio", ascending=False), use_container_width=True)
+        if not rrg_df.empty:
+            try:
+                st.dataframe(rrg_df.sort_values("RS_Ratio", ascending=False).style.background_gradient(cmap="Greens", subset=["RS_Ratio"]), use_container_width=True)
+            except Exception:
+                # Fallback if matplotlib fails or other styling issue
+                st.dataframe(rrg_df.sort_values("RS_Ratio", ascending=False), use_container_width=True)
+        else:
+            st.write("No data available.")
 
 except Exception as e:
-    st.error(f"Critical Error: {e}")
-    st.write("Debug Trace:", e)
+    st.error(f"Critical System Error: {e}")
+    # Print simple trace for debugging
+    import traceback
+    st.text(traceback.format_exc())
