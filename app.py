@@ -2,274 +2,239 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.express as px
 import plotly.graph_objects as go
+import plotly.express as px
 from datetime import datetime
 
 # --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Market Command Center", layout="wide", page_icon="📡")
+st.set_page_config(page_title="Market Regime Compass", layout="wide", page_icon="🧭")
 
-# --- 1. SIDEBAR: STRATEGY CONTROLS ---
-st.sidebar.header("🎛️ Strategy Inputs")
+# --- 1. SIDEBAR: THRESHOLDS ---
+st.sidebar.header("🎛️ Calibration")
 
-with st.sidebar.expander("1. Technical Thresholds", expanded=True):
-    sma_fast = st.number_input("Fast SMA (Trend)", value=50, help="Medium-term trend line.")
-    sma_slow = st.number_input("Slow SMA (Regime)", value=200, help="Long-term 'Line in the Sand'.")
-    adx_threshold = st.slider("Trend Strength (ADX)", 10, 50, 25)
+with st.sidebar.expander("1. Trend Boundaries (Y-Axis)", expanded=True):
+    sma_slow = st.number_input("Bull/Bear Line (SMA)", 50, 365, 200, help="The boundary between Bull and Bear.")
+    sma_fast = st.number_input("Conflict Zone (SMA)", 20, 100, 50, help="Used to define the 'Conflict/Chop' middle zone.")
 
-with st.sidebar.expander("2. Fundamental Thresholds", expanded=True):
-    # Historical S&P 500 average P/E is roughly 15-20.
-    pe_cheap = st.slider("P/E Undervalued", 10, 20, 15, help="Below this = Cheap/Value Zone.")
-    pe_expensive = st.slider("P/E Overvalued", 20, 40, 25, help="Above this = Expensive/Bubble Zone.")
-
-with st.sidebar.expander("3. Cycle Sensitivity"):
-    cycle_window = st.slider("RRG Trend Lookback", 10, 100, 20)
-    momentum_window = st.slider("RRG Momentum Lookback", 3, 30, 10)
+with st.sidebar.expander("2. Value Boundaries (X-Axis)", expanded=True):
+    pe_cheap = st.slider("Undervalued P/E", 10, 20, 15)
+    pe_expensive = st.slider("Overvalued P/E", 20, 40, 25)
 
 # --- 2. DATA ENGINE ---
-@st.cache_data(ttl=3600) # Cache for 1 hour since fundamentals don't change often
-def get_data():
-    tickers = {
-        'Benchmarks': ['SPY', 'QQQ', 'IWM', 'GLD', 'BTC-USD', 'TLT'],
-        'Sectors': ['XLK', 'XLE', 'XLF', 'XLV', 'XLP', 'XLY', 'XLI', 'XLB', 'XLRE', 'XLC', 'XLU'],
-        'Indicators': ['^VIX', '^VIX3M']
-    }
-    all_symbols = [item for sublist in tickers.values() for item in sublist]
+@st.cache_data(ttl=3600)
+def get_data_and_fundamentals():
+    tickers = ['SPY', '^VIX']
+    # Fetch History
+    data = yf.download(tickers, period="2y", progress=False)
     
-    # 1. Fetch Price History
-    history = yf.download(all_symbols, period="2y", progress=False)
-    
-    # 2. Fetch Fundamentals (P/E Ratios)
-    # Note: Fetching TTM PE for ETFs can be tricky via free API. 
-    # We use a known proxy method: retrieving 'trailingPE' from yf.Ticker info.
-    # This is slower, so we cache it.
-    fundamentals = {}
-    for sym in tickers['Benchmarks'] + tickers['Sectors']:
-        try:
-            # We skip currencies/commodities for P/E
-            if sym in ['GLD', 'BTC-USD', 'TLT', '^VIX', '^VIX3M']:
-                fundamentals[sym] = np.nan
-            else:
-                info = yf.Ticker(sym).info
-                fundamentals[sym] = info.get('trailingPE', np.nan)
-        except:
-            fundamentals[sym] = np.nan
-            
-    return history, fundamentals, tickers
-
-# --- 3. LOGIC ENGINE ---
-def analyze_market(history, fundamentals):
-    # Fix Data
+    # Fetch SPY Fundamentals (Earnings)
+    # We derive Earnings from Price / PE to reverse engineer the "E"
+    spy_ticker = yf.Ticker("SPY")
     try:
-        closes = history['Close'].ffill()
-        highs = history['High'].ffill()
-        lows = history['Low'].ffill()
-    except KeyError:
-        closes = history.ffill()
-        highs = closes
-        lows = closes
+        current_pe = spy_ticker.info.get('trailingPE', 24.5) # Default fallback if API fails
+        price = data['Close']['SPY'].iloc[-1]
+        earnings = price / current_pe
+    except:
+        current_pe = 25.0
+        earnings = 10.0 # Fallback
+        
+    return data, current_pe, earnings
 
-    latest = closes.iloc[-1]
-    
-    # --- A. TECHNICAL DEEP DIVE ---
-    spy = closes['SPY']
-    val_fast = spy.rolling(sma_fast).mean().iloc[-1]
-    val_slow = spy.rolling(sma_slow).mean().iloc[-1]
-    curr_price = spy.iloc[-1]
-    
-    # 1. Crossover Logic
-    # Golden Cross: Fast > Slow. Death Cross: Fast < Slow.
-    alignment = "BULLISH STACK" if val_fast > val_slow else "BEARISH STACK"
-    
-    # 2. Location Logic
-    if curr_price > val_fast and curr_price > val_slow:
-        loc = "Full Bull"
-    elif curr_price < val_fast and curr_price < val_slow:
-        loc = "Full Bear"
+# --- 3. LOGIC & SCENARIO ENGINE ---
+def calculate_regime_state(price, sma200, sma50, pe, pe_cheap, pe_exp):
+    # 1. Determine Trend Coordinate (Y)
+    # 0 = Bear, 1 = Conflict, 2 = Bull
+    if price < sma200 and price < sma50:
+        trend_score = 0 # Bear
+        trend_name = "BEAR"
+    elif price > sma200 and price > sma50:
+        trend_score = 2 # Bull
+        trend_name = "BULL"
     else:
-        loc = "Conflict/Correction"
-        
-    # 3. ADX
-    def calc_adx(high, low, close, lookback=14):
-        plus_dm = high.diff()
-        minus_dm = low.diff()
-        plus_dm[plus_dm < 0] = 0
-        minus_dm[minus_dm > 0] = 0
-        tr1 = pd.DataFrame(high - low)
-        tr2 = pd.DataFrame(abs(high - close.shift(1)))
-        tr3 = pd.DataFrame(abs(low - close.shift(1)))
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(lookback).mean()
-        plus_di = 100 * (plus_dm.ewm(alpha=1/lookback).mean() / atr)
-        minus_di = 100 * (abs(minus_dm).ewm(alpha=1/lookback).mean() / atr)
-        sum_di = plus_di + minus_di
-        sum_di = sum_di.replace(0, 0.0001)
-        dx = 100 * (abs(plus_di - minus_di) / sum_di)
-        return dx.rolling(lookback).mean().iloc[-1]
+        trend_score = 1 # Conflict
+        trend_name = "CONFLICT"
 
-    adx = calc_adx(highs['SPY'], lows['SPY'], closes['SPY'])
-    
-    # --- B. FUNDAMENTAL DEEP DIVE ---
-    spy_pe = fundamentals.get('SPY', np.nan)
-    
-    if pd.isna(spy_pe):
-        valuation = "Unknown"
-    elif spy_pe < pe_cheap:
-        valuation = "Undervalued (Value)"
-    elif spy_pe > pe_expensive:
-        valuation = "Overvalued (Expensive)"
+    # 2. Determine Value Coordinate (X)
+    # 0 = Undervalued, 1 = Fair, 2 = Overvalued
+    if pe < pe_cheap:
+        value_score = 0
+        value_name = "UNDERVALUED"
+    elif pe > pe_exp:
+        value_score = 2
+        value_name = "OVERVALUED"
     else:
-        valuation = "Fair Value"
-        
-    # --- C. FUSION SIGNAL ---
-    # Combine Tech + Fund
-    if "Bull" in loc and "Undervalued" in valuation:
-        fusion = "💎 GENERATIONAL BUY (Cheap + Rising)"
-        fusion_color = "green"
-    elif "Bull" in loc and "Overvalued" in valuation:
-        fusion = "🔥 MELT UP (Expensive + Rising)"
-        fusion_color = "orange"
-    elif "Bear" in loc and "Overvalued" in valuation:
-        fusion = "💣 BUBBLE POP (Expensive + Falling)"
-        fusion_color = "red"
-    elif "Bear" in loc and "Undervalued" in valuation:
-        fusion = "🛒 VALUE TRAP (Cheap + Falling)"
-        fusion_color = "blue"
-    else:
-        fusion = "MIXED / HOLD"
-        fusion_color = "gray"
+        value_score = 1
+        value_name = "FAIR VALUE"
 
-    return {
-        'price': curr_price,
-        'sma_fast': val_fast,
-        'sma_slow': val_slow,
-        'alignment': alignment,
-        'location': loc,
-        'adx': adx,
-        'pe': spy_pe,
-        'valuation': valuation,
-        'fusion': fusion,
-        'fusion_color': fusion_color,
-        'vix': latest['^VIX'],
-        'vix3m': latest['^VIX3M']
-    }
-
-def calculate_rrg(df, fundamentals, sectors, benchmark='SPY'):
-    # Prepare RRG Data
-    results = []
-    bench_close = df['Close'][benchmark].ffill()
+    # 3. Define the 9 Narratives
+    matrix_names = [
+        ["Value Trap (Catching Knives)", "Standard Correction", "Bubble Pop (Crash)"],  # Bear Row
+        ["Accumulation Zone", "Rotation / Chop", "Distribution Top"],                   # Conflict Row
+        ["Generational Buy", "Goldilocks Growth", "Melt-Up (FOMO)"]                     # Bull Row
+    ]
     
-    for sector in sectors:
-        sec_close = df['Close'][sector].ffill()
-        rs = sec_close / bench_close
-        rs_mean = rs.rolling(window=cycle_window).mean()
-        rs_ratio = 100 + ((rs - rs_mean) / rs_mean) * 100
-        rs_mom = 100 + rs_ratio.diff(momentum_window)
-        
-        # Get PE
-        pe = fundamentals.get(sector, 0)
-        
-        results.append({
-            'Sector': sector,
-            'RS_Ratio': rs_ratio.iloc[-1],
-            'RS_Momentum': rs_mom.iloc[-1],
-            'PE': pe if not pd.isna(pe) else 0, # Size bubble by PE
-            'Status': "LEADING" if rs_ratio.iloc[-1] > 100 and rs_mom.iloc[-1] > 100 else "LAGGING"
-        })
-        
-    # Add Benchmark
-    results.append({'Sector': 'SPY', 'RS_Ratio': 100, 'RS_Momentum': 100, 'PE': fundamentals.get('SPY', 20), 'Status': 'BENCH'})
-    return pd.DataFrame(results)
+    current_narrative = matrix_names[trend_score][value_score]
+    
+    return trend_score, value_score, trend_name, value_name, current_narrative
 
-# --- 4. EXECUTION ---
+def calculate_scenarios(price, earnings, sma200, sma50, pe_cheap, pe_exp):
+    """
+    Calculates distance to nearest boundaries
+    """
+    scenarios = []
+    
+    # A. Price Moves (Vertical Shift)
+    dist_to_bear = ((sma200 - price) / price) * 100
+    if price > sma200:
+        scenarios.append(f"📉 **- {abs(dist_to_bear):.1f}% drop** leads to **BEAR** Trend.")
+    else:
+        scenarios.append(f"📈 **+ {abs(dist_to_bear):.1f}% rally** leads to **BULL** Trend.")
+
+    # B. Valuation Moves (Horizontal Shift)
+    # Target Price = Target_PE * Earnings
+    target_price_fair = pe_cheap * earnings
+    target_price_exp = pe_exp * earnings
+    
+    dist_to_fair = ((target_price_fair - price) / price) * 100
+    dist_to_exp = ((target_price_exp - price) / price) * 100
+    
+    current_pe = price / earnings
+    
+    if current_pe > pe_exp:
+        scenarios.append(f"📉 **- {abs(dist_to_exp):.1f}% drop** (or earnings growth) needed to reach **FAIR VALUE**.")
+    elif current_pe < pe_cheap:
+        scenarios.append(f"📈 **+ {abs(dist_to_fair):.1f}% rally** needed to become **FAIR VALUE**.")
+        
+    return scenarios
+
+# --- 4. VISUALIZATION ENGINE ---
+def plot_regime_compass(trend_score, value_score):
+    # The Grid Labels
+    z = [[0, 1, 2], [3, 4, 5], [6, 7, 8]] # Color mapping
+    
+    # Custom Colors for the heatmap (Red -> Yellow -> Green logic mixed with Risk)
+    # Row 0 (Bear): Blue (Cheap Trap), Red (Correction), Dark Red (Crash)
+    # Row 1 (Chop): Cyan (Accum), Gray (Chop), Orange (Dist)
+    # Row 2 (Bull): Bright Green (Gen Buy), Green (Goldilocks), Magenta (Melt Up)
+    colors = [
+        [0.0, "blue"], [0.1, "red"], [0.3, "darkred"],      # Bear Row
+        [0.4, "cyan"], [0.5, "gray"], [0.6, "orange"],      # Conflict Row
+        [0.7, "lime"], [0.8, "green"], [1.0, "magenta"]     # Bull Row
+    ]
+    
+    labels = [
+        ["Value Trap", "Correction", "Bubble Pop"],
+        ["Accumulation", "Rotation", "Distribution"],
+        ["Gen. Buy", "Goldilocks", "Melt-Up"]
+    ]
+
+    fig = go.Figure()
+
+    # 1. The Heatmap Background
+    fig.add_trace(go.Heatmap(
+        z=[[0.2, 0.1, 0.05], [0.5, 0.4, 0.3], [0.9, 0.8, 0.6]], # Dummy Z for coloring
+        x=['Undervalued', 'Fair', 'Overvalued'],
+        y=['Bear', 'Conflict', 'Bull'],
+        colorscale='RdYlGn', 
+        showscale=False,
+        opacity=0.6
+    ))
+
+    # 2. The Text Labels
+    annotations = []
+    for y in range(3):
+        for x in range(3):
+            fig.add_annotation(
+                x=x, y=y,
+                text=f"<b>{labels[y][x]}</b>",
+                showarrow=False,
+                font=dict(color="black", size=14)
+            )
+
+    # 3. The "You Are Here" Marker
+    # We add random jitter to the score so the dot isn't always perfectly centered, 
+    # making it look more analog if we had granular data (simulated here for UI)
+    fig.add_trace(go.Scatter(
+        x=[value_score], y=[trend_score],
+        mode='markers+text',
+        marker=dict(size=25, color='white', line=dict(width=3, color='black')),
+        text=["📍 YOU"], textposition="top center",
+        name="Current State"
+    ))
+
+    fig.update_layout(
+        title="The 9 Narratives Matrix",
+        xaxis=dict(title="Valuation", side="bottom"),
+        yaxis=dict(title="Trend Strength"),
+        height=500,
+        margin=dict(l=20, r=20, t=40, b=20)
+    )
+    return fig
+
+# --- 5. MAIN EXECUTION ---
 try:
-    with st.spinner("Crunching Numbers (Price + Fundamentals)..."):
-        history, fundamentals, tickers = get_data()
-    
-    sig = analyze_market(history, fundamentals)
-    rrg_df = calculate_rrg(history, fundamentals, tickers['Sectors'])
+    with st.spinner("Calibrating Compass..."):
+        data, current_pe, earnings = get_data_and_fundamentals()
+        
+        # Process Data
+        try:
+            closes = data['Close'].ffill()
+        except KeyError:
+            closes = data.ffill()
 
-    # --- TITLE SECTION ---
-    st.title("📡 Market Command Center")
-    st.markdown(f"### Overall Signal: :{sig['fusion_color']}[{sig['fusion']}]")
+        price = closes['SPY'].iloc[-1]
+        sma200 = closes['SPY'].rolling(sma_slow).mean().iloc[-1]
+        sma50 = closes['SPY'].rolling(sma_fast).mean().iloc[-1]
+        
+        # Calculate State
+        t_score, v_score, t_name, v_name, narrative = calculate_regime_state(
+            price, sma200, sma50, current_pe, pe_cheap, pe_expensive
+        )
+        
+        # Calculate Scenarios
+        next_moves = calculate_scenarios(price, earnings, sma200, sma50, pe_cheap, pe_expensive)
+
+    # --- UI LAYOUT ---
+    st.title(f"📍 Market Status: {narrative}")
     
-    # --- ROW 1: THE METRICS BOARD ---
+    # Top Metrics
     c1, c2, c3, c4 = st.columns(4)
-    
-    with c1:
-        # Technicals
-        delta = sig['price'] - sig['sma_slow']
-        st.metric("Price vs Slow SMA", 
-                  f"${sig['price']:.2f}",
-                  f"{delta:.2f} ({(delta/sig['sma_slow'])*100:.1f}%)",
-                  help=f"Price: ${sig['price']:.2f}\nSMA{int(sma_slow)}: ${sig['sma_slow']:.2f}")
-        st.caption(f"Trend Stack: {sig['alignment']}")
-
-    with c2:
-        # Technical Nuance
-        spread = sig['sma_fast'] - sig['sma_slow']
-        st.metric(f"SMA Spread ({int(sma_fast)} vs {int(sma_slow)})", 
-                  f"${spread:.2f}",
-                  "Widening" if spread > 0 else "Converging",
-                  help=f"SMA{int(sma_fast)}: ${sig['sma_fast']:.2f}\nSMA{int(sma_slow)}: ${sig['sma_slow']:.2f}")
-        st.caption(f"ADX Strength: {sig['adx']:.1f}")
-
-    with c3:
-        # Fundamentals
-        st.metric("S&P 500 P/E Ratio", 
-                  f"{sig['pe']:.2f}" if not pd.isna(sig['pe']) else "N/A",
-                  sig['valuation'],
-                  delta_color="off",
-                  help=f"Cheap < {pe_cheap} | Expensive > {pe_expensive}")
-        st.caption("Trailing 12-Month Earnings")
-
-    with c4:
-        # Risk / Fear
-        vix_ratio = sig['vix'] / sig['vix3m'] if sig['vix3m'] else 1
-        st.metric("Volatility Regime", 
-                  f"{sig['vix']:.2f}", 
-                  "Backwardation (Fear)" if vix_ratio > 1 else "Contango (Calm)",
-                  delta_color="inverse")
-        st.caption(f"Term Ratio: {vix_ratio:.2f}")
+    c1.metric("Current Regime", f"{t_name} + {v_name}", narrative)
+    c2.metric("S&P 500 Price", f"${price:.2f}", f"{(price/sma200 - 1)*100:.1f}% vs SMA{sma_slow}")
+    c3.metric("Valuation (P/E)", f"{current_pe:.1f}x", f"Earnings Est: ${earnings:.2f}")
+    c4.metric("Risk Level", "HIGH" if v_score==2 or t_score==0 else "MODERATE")
 
     st.markdown("---")
 
-    # --- ROW 2: FUSION INSIGHTS (Tech + Fund) ---
-    t1, t2 = st.tabs(["🧩 Sector Valuation Matrix", "🔄 Strategic Rotation"])
-    
-    with t1:
-        st.subheader("Where is the Value?")
-        st.info("X-Axis: Relative Strength (Momentum) | Y-Axis: P/E Ratio (Value). ideal = Bottom Right (Strong + Cheap).")
+    # The Core Matrix & Forecast
+    col_map, col_logic = st.columns([2, 1])
+
+    with col_map:
+        st.subheader("🗺️ The Strategic Map")
+        fig = plot_regime_compass(t_score, v_score)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with col_logic:
+        st.subheader("🔮 Forecast & Next Moves")
+        st.info(f"We are currently in the **{narrative}** zone.")
         
-        # Scatter: Momentum (X) vs Value (Y)
-        # Note: We invert Y axis usually because Lower PE is better
-        fig_val = px.scatter(rrg_df, x="RS_Ratio", y="PE", 
-                             text="Sector", size="PE", color="RS_Ratio",
-                             color_continuous_scale="RdYlGn",
-                             title="Momentum vs. Valuation")
-        
-        # Add Lines
-        fig_val.add_hline(y=pe_expensive, line_dash="dash", line_color="red", annotation_text="Expensive")
-        fig_val.add_hline(y=pe_cheap, line_dash="dash", line_color="green", annotation_text="Cheap")
-        fig_val.add_vline(x=100, line_dash="solid", line_color="gray")
-        
-        st.plotly_chart(fig_val, use_container_width=True)
-        
-    with t2:
-        st.subheader("Sector Rotation Cycle")
-        st.info("Size of bubble = P/E Ratio (Bigger = More Expensive).")
-        
-        fig_rrg = px.scatter(rrg_df, x="RS_Ratio", y="RS_Momentum", 
-                             text="Sector", size="PE", color="Status",
-                             color_discrete_map={'LEADING': 'green', 'LAGGING': 'red', 'BENCH': 'black'},
-                             title="Relative Rotation Graph (Sized by P/E)")
-        
-        fig_rrg.add_hline(y=100, line_color="gray")
-        fig_rrg.add_vline(x=100, line_color="gray")
-        fig_rrg.update_layout(height=600)
-        
-        st.plotly_chart(fig_rrg, use_container_width=True)
+        st.markdown("### How we leave this zone:")
+        for move in next_moves:
+            st.markdown(move)
+            
+        st.markdown("---")
+        st.markdown("### Strategic Directive:")
+        if narrative == "Melt-Up (FOMO)":
+            st.warning("⚠️ **Strategy:** Participate, but tighten stops. Do not add new leverage. Look for exit liquidity.")
+        elif narrative == "Goldilocks Growth":
+            st.success("✅ **Strategy:** Buy Aggressively. Fundamentals and Technicals agree.")
+        elif narrative == "Value Trap (Catching Knives)":
+            st.error("🛑 **Strategy:** Do NOT Buy. Wait for Trend to turn Positive (Price > SMA).")
+        elif narrative == "Distribution Top":
+            st.warning("⚠️ **Strategy:** Reduce Position Size. Smart money is selling.")
+        else:
+            st.info("ℹ️ **Strategy:** Stick to your system. No extreme signals present.")
 
 except Exception as e:
-    st.error(f"Data Error: {e}")
-    st.warning("Note: Fundamental data (P/E) relies on Yahoo Finance headers which can sometimes be blocked or slow.")
+    st.error(f"System Error: {e}")
+    st.write("Debug Info:", e)
